@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -8,7 +9,9 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 
@@ -47,6 +50,20 @@ var (
 			MarginBottom(0).
 			PaddingTop(0).
 			PaddingBottom(0)
+)
+
+type State int
+
+const (
+	Fetch State = iota
+	QuestionStart
+	QuestionCorrect
+	QuestionRetry
+	QuestionFailed
+	CodeStart
+	CodeTest
+	NextLesson
+	CourseFinished
 )
 
 type StarterFile struct {
@@ -90,6 +107,7 @@ type Response struct {
 		ChapterTitle        string `json:"ChapterTitle"`
 		ChapterSlug         string `json:"ChapterSlug"`
 		LessonDataCodeTests struct {
+			ProgLang     string
 			StarterFiles []struct {
 				Name       string `json:"Name"`
 				Content    string `json:"Content"`
@@ -99,6 +117,7 @@ type Response struct {
 			Readme string `json:"Readme"`
 		} `json:"LessonDataCodeTests"`
 		LessonDataCodeCompletion struct {
+			ProgLang     string
 			StarterFiles []struct {
 				Name       string `json:"Name"`
 				Content    string `json:"Content"`
@@ -115,7 +134,99 @@ type Response struct {
 			} `json:"Question"`
 		} `json:"LessonDataMultipleChoice"`
 	} `json:"Lesson"`
+	Course struct {
+		UUID                         string   `json:"UUID"`
+		Slug                         string   `json:"Slug"`
+		Title                        string   `json:"Title"`
+		GenericTitle                 string   `json:"GenericTitle"`
+		ShortDescription             string   `json:"ShortDescription"`
+		Description                  string   `json:"Description"`
+		ThumbnailURL                 string   `json:"ThumbnailURL"`
+		PrerequisiteCourseUUIDS      []string `json:"PrerequisiteCourseUUIDS"`
+		EstimatedCompletionTimeHours int      `json:"EstimatedCompletionTimeHours"`
+		TypeDescription              string   `json:"TypeDescription"`
+		LastUpdated                  string   `json:"LastUpdated"`
+		SlugAliases                  []string `json:"SlugAliases"`
+		AuthorUUIDs                  []string `json:"AuthorUUIDs"`
+		MaintainerUUIDs              []string `json:"MaintainerUUIDs"`
+		Alternatives                 []string `json:"Alternatives"`
+		Status                       string   `json:"Status"`
+		NumLessons                   int      `json:"NumLessons"`
+		Chapters                     []struct {
+			UUID        string `json:"UUID"`
+			Slug        string `json:"Slug"`
+			Title       string `json:"Title"`
+			Description string `json:"Description"`
+			Lessons     any    `json:"Lessons"`
+			NumLessons  int    `json:"NumLessons"`
+			CourseUUID  string `json:"CourseUUID"`
+		} `json:"Chapters"`
+		Language     string `json:"Language"`
+		CompletionXp int    `json:"CompletionXp"`
+		NumEnrolled  int    `json:"NumEnrolled"`
+		Rating       struct {
+			Average    float64 `json:"Average"`
+			TotalCount int     `json:"TotalCount"`
+		} `json:"Rating"`
+		FirstLessonUUID        string `json:"FirstLessonUUID"`
+		RecommendedCommunities []struct {
+			Link string `json:"Link"`
+			Name string `json:"Name"`
+		} `json:"RecommendedCommunities"`
+		Teachers struct {
+			Authors []struct {
+				UUID            string `json:"UUID"`
+				FirstName       string `json:"FirstName"`
+				LastName        string `json:"LastName"`
+				Slug            string `json:"Slug"`
+				Subtitle        string `json:"Subtitle"`
+				Bio             string `json:"Bio"`
+				YouTubeURL      string `json:"YouTubeURL"`
+				TwitterURL      string `json:"TwitterURL"`
+				GitHubURL       string `json:"GitHubURL"`
+				LinkedInURL     string `json:"LinkedInURL"`
+				ProfileImageURL string `json:"ProfileImageURL"`
+				TwitchURL       string `json:"TwitchURL"`
+			} `json:"Authors"`
+			Maintainers []struct {
+				UUID            string `json:"UUID"`
+				FirstName       string `json:"FirstName"`
+				LastName        string `json:"LastName"`
+				Slug            string `json:"Slug"`
+				Subtitle        string `json:"Subtitle"`
+				Bio             string `json:"Bio"`
+				YouTubeURL      string `json:"YouTubeURL"`
+				TwitterURL      string `json:"TwitterURL"`
+				GitHubURL       string `json:"GitHubURL"`
+				LinkedInURL     string `json:"LinkedInURL"`
+				ProfileImageURL string `json:"ProfileImageURL"`
+				TwitchURL       string `json:"TwitchURL"`
+			} `json:"Maintainers"`
+		} `json:"Teachers"`
+	}
 }
+
+type CourseProgressResponse struct {
+	CourseUUID string `json:"CourseUUID"`
+	Chapters   []struct {
+		UUID    string `json:"UUID"`
+		Title   string `json:"Title"`
+		Lessons []struct {
+			UUID       string `json:"UUID"`
+			Title      string `json:"Title"`
+			IsRequired bool   `json:"IsRequired"`
+			IsComplete bool   `json:"IsComplete"`
+			IsReset    bool   `json:"IsReset"`
+		}
+	}
+}
+
+const (
+	BASE_API_URL        = "https://api.boot.dev/v1/"
+	LESSON_URL          = BASE_API_URL + "static/lessons/"
+	COURSE_URL          = BASE_API_URL + "static/courses/slug/"
+	COURSE_PROGRESS_URL = BASE_API_URL + "course_progress_by_lesson/"
+)
 
 type errMsg struct {
 	err error
@@ -127,45 +238,57 @@ type item struct {
 	title string
 }
 
-func (i item) Title() string       { return i.title }
+func (i item) Title() string { return i.title }
+
 func (i item) Description() string { return "" }
+
 func (i item) FilterValue() string { return i.title }
 
 // Model for our Bubble Tea application
 type Model struct {
-	state          int
-	list           list.Model
-	selectedAnswer int
-	width          int
-	height         int
-	lessonURL      string
-	err            error
-	response       *Response
-	attempts       int
+	state                  State
+	list                   list.Model
+	selectedAnswer         int
+	width                  int
+	height                 int
+	lessonURL              string
+	err                    error
+	courseURL              string
+	response               *Response
+	courseProgressResponse *CourseProgressResponse
+	starterFiles           []string
+	mdEditor               string
+	codeEditor             string
+	attempts               int
 }
 
-func convertToAPIURL(inputURL string) string {
+func convertToAPIURL(endpoint string, inputURL string) string {
 	// Extract UUID from the URL
 	parts := strings.Split(inputURL, "/")
-	var uuid string
-	for i, part := range parts {
-		if i == len(parts)-1 {
-			uuid = part
-			break
-		}
-	}
 
 	// Return API URL regardless of UUID length
-	return fmt.Sprintf("https://api.boot.dev/v1/static/lessons/%s", uuid)
+	return fmt.Sprintf("%s%s", endpoint, parts[len(parts)-1])
 }
 
-func initialModel(url string) Model {
+func initialModel(url string, mdEditor string, codeEditor string) Model {
+	var lessonURL string
+	var courseURL string
+	lessonURL = url
+	if strings.Contains(url, "courses") {
+		lessonURL = ""
+		courseURL = url
+	}
 	return Model{
-		list:           list.New([]list.Item{}, list.NewDefaultDelegate(), 0, 0),
-		selectedAnswer: 0,
-		state:          1, // Start in fetch state
-		lessonURL:      convertToAPIURL(url),
-		attempts:       0,
+		list:                   list.New([]list.Item{}, list.NewDefaultDelegate(), 0, 0),
+		selectedAnswer:         0,
+		state:                  Fetch, // Start in fetch state
+		lessonURL:              convertToAPIURL(LESSON_URL, lessonURL),
+		courseURL:              convertToAPIURL(COURSE_URL, courseURL),
+		attempts:               0,
+		mdEditor:               mdEditor,
+		codeEditor:             codeEditor,
+		courseProgressResponse: nil,
+		response:               &Response{},
 	}
 }
 
@@ -180,35 +303,104 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "ctrl+c", "q":
 			return m, tea.Quit
 		case "up", "k":
-			if m.state == 2 {
+			if m.state == QuestionStart {
 				m.list.CursorUp()
 			}
 			return m, nil
 		case "down", "j":
-			if m.state == 2 {
+			if m.state == QuestionStart {
 				m.list.CursorDown()
 			}
 			return m, nil
 		case "enter":
-			if m.state == 2 {
+			switch m.state {
+			case QuestionStart:
 				selectedAnswer := m.list.Items()[m.list.Index()].(item).title
 				if selectedAnswer == m.response.Lesson.LessonDataMultipleChoice.Question.Answer {
-					m.state = 3 // Success state
+					m.state = QuestionCorrect // Success state
 				} else {
 					m.attempts++
 					if m.attempts >= 3 {
-						m.state = 5 // Failed state
+						m.state = QuestionFailed // Failed state
 					} else {
-						m.state = 4 // Try again state
+						m.state = QuestionRetry // Try again state
 					}
 				}
 				return m, nil
-			} else if m.state == 4 {
+			case QuestionRetry:
 				// Reset to question state for retry
-				m.state = 2
+				m.state = QuestionStart
 				return m, nil
+			case CodeStart:
+				cmd, err := openFiles(m.codeEditor, m.starterFiles)
+				if err != nil {
+					m.err = fmt.Errorf("could not open code files %v", err)
+					return m, tea.Quit
+				}
+				cmd2, err := openFiles(m.mdEditor, []string{"README.md"})
+				if err != nil {
+					m.err = fmt.Errorf("could not open code files %v", err)
+					return m, tea.Quit
+				}
+				cmd.Wait()
+				cmd2.Wait()
+				if m.response.Lesson.Type == "type_code_tests" {
+					m.state = CodeTest
+				} else {
+					m.state = NextLesson
+				}
+				return m, nil
+			case CodeTest:
+				var makeFile string
+				if m.response.Lesson.Type == "type_code_tests" {
+					makeFile = ".lib/" + m.response.Lesson.LessonDataCodeTests.ProgLang + "/Makefile"
+				} else {
+					makeFile = ".lib/" + m.response.Lesson.LessonDataCodeCompletion.ProgLang + "/Makefile"
+				}
+				if _, err := os.Stat(makeFile); err != nil {
+					m.err = fmt.Errorf("could not open MakeFile: %v", err)
+					return m, tea.Quit
+				}
+				cmd := exec.Command("make", "-f", makeFile, path.Join(m.response.Lesson.CourseSlug,
+					m.response.Lesson.ChapterSlug, m.response.Lesson.Slug))
+
+				var stderr, stdout bytes.Buffer
+				cmd.Stdout = &stdout
+				cmd.Stderr = &stderr
+				err := cmd.Start()
+				if err != nil {
+					m.err = fmt.Errorf("err in starting test: %v", err)
+				}
+
+				cmd.Wait()
+
+				if cmd.ProcessState.ExitCode() != 0 {
+					m.err = fmt.Errorf("test failed %v", stderr.String())
+					return m, tea.Quit
+				}
+				print(stdout.String())
+				m.state = NextLesson
+				return m, nil
+			case NextLesson:
+				m.state = Fetch
+				chapNum := getChapterNumber(m.response.Lesson.ChapterSlug)
+				chap := m.courseProgressResponse.Chapters[chapNum]
+				lessonNum := getLessonNumber(m.response.Lesson.Slug) + 1
+				if lessonNum >= len(chap.Lessons) {
+					chapNum = chapNum + 1
+					if chapNum >= len(m.courseProgressResponse.Chapters) {
+						m.state = CourseFinished
+						return m, nil
+					}
+					chap = m.courseProgressResponse.Chapters[chapNum]
+					lessonNum = 0
+				}
+				m.lessonURL = chap.Lessons[lessonNum].UUID
+				return m, m.fetchLesson
+			case CourseFinished:
+				return m, tea.Quit
 			}
-			return m, tea.Quit
+			return m, nil
 		}
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
@@ -217,9 +409,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case errMsg:
 		m.err = msg.err
 		return m, tea.Quit
+	case *CourseProgressResponse:
+		m.err = fmt.Errorf("picking lesson from course url not implemeted yet")
+		return m, tea.Quit
 	case *Response:
 		// fmt.Println("📦 Processing response...")
-		m.response = msg
+		if m.courseProgressResponse == nil {
+			m.response.Lesson = msg.Lesson
+			res := m.request(COURSE_PROGRESS_URL+msg.Lesson.CourseUUID, reflect.TypeOf(&CourseProgressResponse{}))
+			switch prog := res.(type) {
+			case *CourseProgressResponse:
+				m.courseProgressResponse = prog
+			case errMsg:
+				m.err = prog.err
+				return m, tea.Quit
+			}
+		}
 
 		// fmt.Printf("Checking lesson type: %s\n", m.response.Lesson.Type)
 
@@ -233,26 +438,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			// Create a simple list just to handle the items
 			m.list = list.New(items, list.NewDefaultDelegate(), 0, 0)
-			m.state = 2
+			m.state = QuestionStart
 			return m, nil
 		} else if m.response.Lesson.Type == "type_code_tests" || m.response.Lesson.Type == "type_code" {
 			// fmt.Println("📁 Creating exercise files...")
 
-			// Get chapter and lesson numbers from slugs
-			chapterNum := getChapterNumber(m.response.Lesson.ChapterSlug)
-			lessonNum := getLessonNumber(m.response.Lesson.Slug)
-
-			fmt.Printf("📂 Chapter %d, Lesson %d\n", chapterNum, lessonNum)
+			fmt.Printf(
+				"📂 Course %s, Chapter %s, Lesson %s\n", m.response.Lesson.CourseSlug,
+				m.response.Lesson.ChapterSlug, m.response.Lesson.Slug,
+			)
 
 			// Create chapter directory if it doesn't exist
-			chapterDir := fmt.Sprintf("chapter%d", chapterNum)
-			if err := os.MkdirAll(chapterDir, 0755); err != nil {
-				m.err = fmt.Errorf("failed to create chapter directory: %v", err)
-				return m, tea.Quit
-			}
-
-			// Create exercise directory using lesson number
-			exerciseDir := fmt.Sprintf("%s/exercise%d", chapterDir, lessonNum)
+			chapterDir := fmt.Sprintf("%s/%s", m.response.Lesson.CourseSlug, m.response.Lesson.ChapterSlug)
+			exerciseDir := fmt.Sprintf("%s/%s", chapterDir, m.response.Lesson.Slug)
 			if err := os.MkdirAll(exerciseDir, 0755); err != nil {
 				m.err = fmt.Errorf("failed to create exercise directory: %v", err)
 				return m, tea.Quit
@@ -284,6 +482,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.err = fmt.Errorf("failed to create %s: %v", filePath, err)
 					return m, tea.Quit
 				}
+				m.starterFiles = append(m.starterFiles, file.Name)
 			}
 
 			// Create README.md in the exercise directory
@@ -301,14 +500,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			// fmt.Println("- README.md")
 
-			return m, tea.Quit
+			m.state = CodeStart
+			return m, nil
 		} else {
 			m.err = fmt.Errorf("unknown lesson type: %s", m.response.Lesson.Type)
 			return m, tea.Quit
 		}
 	}
 
-	if m.state == 2 {
+	if m.state == QuestionStart {
 		var cmd tea.Cmd
 		m.list, cmd = m.list.Update(msg)
 		return m, cmd
@@ -323,9 +523,9 @@ func (m Model) View() string {
 	}
 
 	switch m.state {
-	case 1:
+	case Fetch:
 		return "\n  🔄 Fetching lesson data...\n"
-	case 2:
+	case QuestionStart:
 		var s strings.Builder
 		s.WriteString("\n")
 
@@ -368,36 +568,39 @@ func (m Model) View() string {
 		s.WriteString("\n\n  (↑/↓: select • enter: submit • ctrl+c: quit)\n")
 
 		return s.String()
-	case 3:
-		return "\n  ✅ Correct! Great job!\n\nPress enter to exit"
-	case 4:
+	case QuestionCorrect:
+		return "\n  ✅ Correct! Great job!\n\nPress enter to continue"
+	case QuestionRetry:
 		return fmt.Sprintf("\n  ❌ Incorrect. Try again! (%d attempts remaining)\n\n  Press enter to retry...\n", 3-m.attempts)
-	case 5:
+	case QuestionFailed:
 		return fmt.Sprintf("\n  ❌ Incorrect! The correct answer was: %s\n\n", m.response.Lesson.LessonDataMultipleChoice.Question.Answer)
+	case CodeStart:
+		return "Opening files. enter to continue"
+	case CodeTest:
+		return "Testing work. enter to continue"
+	case NextLesson:
+		return "Press Enter to continue to next lesson. ctrl+c: quit"
+	case CourseFinished:
+		return "Course Finished 🎊. Enter to exit"
 	default:
 		return "\n"
 	}
 }
 
-func getCreatedFiles(files []StarterFile) string {
-	var result strings.Builder
-	for _, file := range files {
-		result.WriteString(fmt.Sprintf("- %s\n", file.Name))
-	}
-	result.WriteString("- README.md")
-	return result.String()
-}
+// func getCreatedFiles(files []StarterFile) string {
+// 	var result strings.Builder
+// 	for _, file := range files {
+// 		result.WriteString(fmt.Sprintf("- %s\n", file.Name))
+// 	}
+// 	result.WriteString("- README.md")
+// 	return result.String()
+// }
 
-func (m Model) fetchLesson() tea.Msg {
-	// fmt.Printf("🔍 Fetching lesson data from: %s\n", m.lessonURL)
-
-	// Debug: Print request details
-	// fmt.Printf("Making HTTP GET request to: %s\n", m.lessonURL)
-
-	resp, err := http.Get(m.lessonURL)
+func (m Model) request(url string, t reflect.Type) tea.Msg {
+	resp, err := http.Get(url)
 	if err != nil {
 		fmt.Printf("❌ HTTP request failed: %v\n", err)
-		return errMsg{err: fmt.Errorf("failed to fetch lesson: %v", err)}
+		return errMsg{err: fmt.Errorf("failed to %s lesson: %v", url, err)}
 	}
 	defer resp.Body.Close()
 
@@ -412,7 +615,7 @@ func (m Model) fetchLesson() tea.Msg {
 	// Debug: Print raw response
 	// fmt.Printf("Raw response: %s\n", string(body))
 
-	var response Response
+	response := reflect.New(t).Interface()
 	if err := json.Unmarshal(body, &response); err != nil {
 		fmt.Printf("❌ Failed to parse JSON: %v\n", err)
 		return errMsg{err: fmt.Errorf("failed to parse response: %v", err)}
@@ -425,6 +628,56 @@ func (m Model) fetchLesson() tea.Msg {
 	// fmt.Printf("- Code Files: %v\n", len(response.Lesson.LessonDataCodeTests.StarterFiles))
 
 	return &response
+}
+
+func (m Model) fetchLesson() tea.Msg {
+	// fmt.Printf("🔍 Fetching lesson data from: %s\n", m.lessonURL)
+
+	// Debug: Print request details
+	// fmt.Printf("Making HTTP GET request to: %s\n", m.lessonURL)
+	if m.lessonURL == "" {
+		if m.courseURL == "" {
+			return errMsg{
+				err: fmt.Errorf("course and lesson url are both undefined"),
+			}
+		}
+		res := m.request(m.courseURL, reflect.TypeOf(&Response{}))
+		switch res := res.(type) {
+		case *Response:
+			m.response.Course = res.Course
+			courseProgress := m.request(COURSE_PROGRESS_URL+m.response.Course.UUID, reflect.TypeOf(&CourseProgressResponse{}))
+			return courseProgress
+		case errMsg:
+			return res
+		}
+	}
+
+	return m.request(m.lessonURL, reflect.TypeOf(&Response{}))
+}
+
+func openFiles(editor string, files []string) (*exec.Cmd, error) {
+	var cmd *exec.Cmd
+
+	if editor == "" {
+		for _, file := range files[1:] {
+			cmd = exec.Command(editor, file)
+			cmd.Stderr = os.Stderr
+			cmd.Stdin = os.Stdin
+			cmd.Stdout = os.Stdout
+			err := cmd.Start()
+			if err != nil {
+				return cmd, err
+			}
+		}
+		cmd = exec.Command(editor, files[0])
+	} else {
+		cmd = exec.Command(editor, files...)
+	}
+
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	return cmd, cmd.Start()
 }
 
 // Extract chapter number from ChapterSlug (format: "7-advanced-pointers" -> 7)
@@ -449,14 +702,6 @@ func getLessonNumber(slug string) int {
 	return 0
 }
 
-func openFiles(editor string, files []string) error {
-	if editor == "" {
-		return nil
-	}
-	cmd := exec.Command(editor, files...)
-	return cmd.Start()
-}
-
 func main() {
 	var codeEditor string
 	var mdEditor string
@@ -471,7 +716,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	p := tea.NewProgram(initialModel(args[0]), tea.WithAltScreen())
+	p := tea.NewProgram(initialModel(args[0], codeEditor, mdEditor), tea.WithAltScreen())
 
 	model, err := p.Run()
 	if err != nil {
@@ -480,52 +725,9 @@ func main() {
 	}
 
 	// After program exits, check if we need to open files
-	m, ok := model.(Model)
+	_, ok := model.(Model)
 	if !ok {
 		fmt.Printf("Error: unexpected model type\n")
 		os.Exit(1)
-	}
-
-	if m.response != nil && (m.response.Lesson.Type == "type_code_tests" || m.response.Lesson.Type == "type_code") {
-		chapterNum := getChapterNumber(m.response.Lesson.ChapterSlug)
-		lessonNum := getLessonNumber(m.response.Lesson.Slug)
-		exerciseDir := fmt.Sprintf("chapter%d/exercise%d", chapterNum, lessonNum)
-
-		var codeFiles []string
-		var mdFiles []string
-
-		// Walk through the exercise directory
-		err := filepath.Walk(exerciseDir, func(path string, info os.FileInfo, err error) error {
-			if err != nil {
-				return err
-			}
-			if !info.IsDir() {
-				if strings.HasSuffix(info.Name(), ".md") {
-					mdFiles = append(mdFiles, path)
-				} else {
-					codeFiles = append(codeFiles, path)
-				}
-			}
-			return nil
-		})
-
-		if err != nil {
-			fmt.Printf("Error walking directory: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Open code files
-		if len(codeFiles) > 0 && codeEditor != "" {
-			if err := openFiles(codeEditor, codeFiles); err != nil {
-				fmt.Printf("Error opening code files with %s: %v\n", codeEditor, err)
-			}
-		}
-
-		// Open markdown files
-		if len(mdFiles) > 0 && mdEditor != "" {
-			if err := openFiles(mdEditor, mdFiles); err != nil {
-				fmt.Printf("Error opening markdown files with %s: %v\n", mdEditor, err)
-			}
-		}
 	}
 }
