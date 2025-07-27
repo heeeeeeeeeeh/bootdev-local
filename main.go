@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/andreyvit/diff"
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
@@ -73,6 +74,9 @@ const (
 	CodeTest
 	CodeTestSuccess
 	CodeTestFailed
+	CheckOutput
+	OutputSuccess
+	OutputFail
 	NextLesson
 	TrackSelect
 	CourseSelect
@@ -130,9 +134,10 @@ type Response struct {
 			Readme       string        `json:"Readme"`
 		} `json:"LessonDataCodeTests"`
 		LessonDataCodeCompletion struct {
-			ProgLang     string
-			StarterFiles []StarterFile `json:"StarterFiles"`
-			Readme       string        `json:"Readme"`
+			ProgLang           string
+			StarterFiles       []StarterFile `json:"StarterFiles"`
+			Readme             string        `json:"Readme"`
+			CodeExpectedOutput string        `json:"CodeExpectedOutput"`
 		} `json:"LessonDataCodeCompletion"`
 		LessonDataChoice struct {
 			Readme   string `json:"Readme"`
@@ -335,6 +340,7 @@ type Model struct {
 	mdEditor               string
 	codeEditor             string
 	attempts               int
+	download               bool
 }
 
 func convertToAPIURL(endpoint string, inputURL string) string {
@@ -348,10 +354,11 @@ func convertToAPIURL(endpoint string, inputURL string) string {
 func initialModel(url string, mdEditor string, codeEditor string) Model {
 	var lessonURL string
 	var courseURL string
+	download := false
 	if !reflect.ValueOf(url).IsZero() {
 		if strings.Contains(url, "courses") {
 			courseURL = convertToAPIURL(COURSE_URL, url)
-			lessonURL = ""
+			download = true
 		} else {
 			lessonURL = convertToAPIURL(LESSON_URL, url)
 		}
@@ -362,6 +369,7 @@ func initialModel(url string, mdEditor string, codeEditor string) Model {
 	}
 	return Model{
 		list:                   list.New([]list.Item{}, list.NewDefaultDelegate(), 0, 0),
+		download:               download,
 		selectedAnswer:         0,
 		state:                  Fetch, // Start in fetch state
 		lessonURL:              lessonURL,
@@ -473,11 +481,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.state = NextLesson
 					cmds = append(cmds, m.getNextLesson())
 				case CodeTest:
+					// TODO: add testing for lessons without unit tests
 					cmds = append(cmds, m.testCode())
 				case CodeTestFailed:
 					cmds = append(cmds, m.openEditor())
 				case CodeTestSuccess:
 					cmds = append(cmds, m.getNextLesson())
+				case CheckOutput:
+					cmds = append(cmds, m.CheckOutput())
 				case NextLesson:
 					cmds = append(cmds, m.getNextLesson())
 				case CourseFinished:
@@ -520,6 +531,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.getLessonType())
 		case CodeTestFailed:
 		case CodeTestSuccess:
+		case NextLesson:
+			cmds = append(cmds, m.getNextLesson())
 		case Fetch:
 			cmds = append(cmds, m.fetchLesson)
 		}
@@ -577,6 +590,13 @@ func (m Model) View() string {
 		return fmt.Sprintf("\n❌ Error: %v\n\nPress any key to exit...\n", m.err)
 	}
 
+	// if m.download {
+	// 	if reflect.ValueOf(m.response.Lesson.UUID).IsZero() {
+	// 		return fmt.Sprintf("Downloading %s", m.courseURL)
+	// 	}
+	// 	return fmt.Sprintf("Downloading %s", m.response.Lesson.Slug)
+	// }
+
 	switch m.state {
 	case Fetch:
 		return "\n  🔄 Fetching lesson data...\n"
@@ -608,6 +628,14 @@ func (m Model) View() string {
 		return m.formatPager()
 	case CodeTestFailed:
 		m.title = "Code Test Failed"
+		return m.formatPager()
+	case CheckOutput:
+		return "Checking Output"
+	case OutputSuccess:
+		m.title = "Output Matches"
+		return m.formatPager()
+	case OutputFail:
+		m.title = "Output does not match"
 		return m.formatPager()
 	case NextLesson:
 		return "Press Enter to continue to next lesson. ctrl+c: quit"
@@ -702,8 +730,10 @@ func (m Model) fetchLesson() tea.Msg {
 		switch res := res.(type) {
 		case *Response:
 			m.response.Course = res.Course
-			courseProgress := request[CourseProgressResponse](COURSE_PROGRESS_URL + m.response.Course.FirstLessonUUID)
-			return courseProgress
+			if m.download {
+				return request[Response](LESSON_URL + m.response.Course.FirstLessonUUID)
+			}
+			return request[CourseProgressResponse](COURSE_PROGRESS_URL + m.response.Course.FirstLessonUUID)
 		case errMsg:
 			return res
 		}
@@ -717,9 +747,11 @@ var p *tea.Program
 func main() {
 	var codeEditor string
 	var mdEditor string
+	var downloadAll bool
 
 	flag.StringVar(&codeEditor, "code-editor", "", "Editor to open code files with (e.g., 'code', 'vim', 'emacs')")
 	flag.StringVar(&mdEditor, "md-editor", "", "Editor to open markdown files with (e.g., 'typora', 'code')")
+	flag.BoolVar(&downloadAll, "download", false, "Download all courses")
 	flag.Parse()
 
 	args := flag.Args()
@@ -754,7 +786,8 @@ func (m Model) getLessonType() tea.Cmd {
 			m.state = CodeTest
 			return m.testCode()()
 		case "type_code":
-			m.state = NextLesson
+			m.state = CheckOutput
+			return m.CheckOutput()()
 		}
 		return m
 	}
@@ -859,7 +892,11 @@ func (m Model) createCodeFiles() tea.Cmd {
 		}
 		m.starterFiles = append(m.starterFiles, readmePath)
 
-		m.state = EditorStart
+		if m.download {
+			m.state = NextLesson
+		} else {
+			m.state = EditorStart
+		}
 		return m
 	}
 }
@@ -929,6 +966,46 @@ func (m Model) testCode() tea.Cmd {
 	}
 }
 
+func (m Model) CheckOutput() tea.Cmd {
+	return func() tea.Msg {
+		script := ".lib/" + m.response.Lesson.LessonDataCodeCompletion.ProgLang + "/run"
+		if _, err := os.Stat(script); err != nil {
+			return errMsg{
+				err: fmt.Errorf("script to run program does not exist: %v", err),
+			}
+		}
+		cmd := exec.Command("bash", script, path.Join(m.response.Lesson.CourseSlug,
+			m.response.Lesson.ChapterSlug, m.response.Lesson.Slug))
+
+		var stderr, stdout bytes.Buffer
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		err := cmd.Start()
+		if err != nil {
+			return errMsg{
+				err: fmt.Errorf("err in starting test: %v", err),
+			}
+		}
+
+		cmd.Wait()
+
+		if cmd.ProcessState.ExitCode() != 0 {
+			m.content = stdout.String() + stderr.String()
+			m.state = OutputFail
+		}
+
+		if stderr.String() == m.response.Lesson.LessonDataCodeCompletion.CodeExpectedOutput {
+			m.content = stderr.String()
+			m.state = OutputSuccess
+		} else {
+			m.content = diff.CharacterDiff(stderr.String(), m.response.Lesson.LessonDataCodeCompletion.CodeExpectedOutput)
+			m.state = OutputFail
+		}
+		m.viewport = m.updateViewport()
+		return m
+	}
+}
+
 func (m Model) commitRepo() error {
 	if _, err := os.Stat(".git"); err != nil {
 		return errMsg{
@@ -938,6 +1015,7 @@ func (m Model) commitRepo() error {
 
 	path := m.lessonPath()
 	cmd := exec.Command("git", "add", path)
+	cmd.Stderr = &bytes.Buffer{}
 	err := cmd.Start()
 	if err != nil {
 		return errMsg{
@@ -948,7 +1026,7 @@ func (m Model) commitRepo() error {
 
 	if cmd.ProcessState.ExitCode() != 0 {
 		return errMsg{
-			err: fmt.Errorf("could not add %s to git repo: %v", path, err),
+			err: fmt.Errorf("could not add %s to git repo: %v", path, cmd.Stderr),
 		}
 	}
 
@@ -960,13 +1038,27 @@ func (m Model) commitRepo() error {
 	err = cmd.Start()
 	if err != nil {
 		return errMsg{
-			err: fmt.Errorf("could not start git commit: %v", cmd.Args),
+			err: fmt.Errorf("could not start git commit: \n%v\n%v", cmd.Args, err),
 		}
 	}
 	cmd.Wait()
 	if cmd.ProcessState.ExitCode() != 0 {
 		return errMsg{
-			err: fmt.Errorf("could not push git repo: %v", err),
+			err: fmt.Errorf("could not commit git repo: %v", cmd.Stderr),
+		}
+	}
+
+	cmd = exec.Command("git", "push")
+	err = cmd.Start()
+	if err != nil {
+		return errMsg{
+			err: fmt.Errorf("git push could not start %v %v", cmd.Args, err),
+		}
+	}
+	cmd.Wait()
+	if cmd.ProcessState.ExitCode() != 0 {
+		return errMsg{
+			err: fmt.Errorf("could not push repo: %v", cmd.Stderr),
 		}
 	}
 
@@ -985,21 +1077,23 @@ func (m Model) getNextLesson() tea.Cmd {
 			}
 		}
 
-		m.commitRepo()
-		m.starterFiles = []string{}
-		chapNum := m.getChapterNumber()
-		chap := m.courseProgressResponse.Chapters[chapNum-1]
-		lessonNum := m.getLessonNumber()
-		if lessonNum >= len(chap.Lessons) {
-			chapNum = chapNum + 1
-			if chapNum >= len(m.courseProgressResponse.Chapters) {
-				m.state = CourseFinished
-				return nil
-			}
-			chap = m.courseProgressResponse.Chapters[chapNum]
-			lessonNum = 0
+		if !m.download {
+			m.commitRepo()
 		}
-		m.lessonURL = LESSON_URL + chap.Lessons[lessonNum].UUID
+		m.starterFiles = []string{}
+		currChapNum := m.getChapterNumber() - 1
+		currChap := m.courseProgressResponse.Chapters[currChapNum]
+		chap := currChap
+		nextLessonNum := m.getLessonNumber()
+		if nextLessonNum >= len(currChap.Lessons) {
+			if currChapNum+1 >= len(m.courseProgressResponse.Chapters) {
+				m.state = CourseFinished
+				return m
+			}
+			chap = m.courseProgressResponse.Chapters[currChapNum+1]
+			nextLessonNum = 0
+		}
+		m.lessonURL = LESSON_URL + chap.Lessons[nextLessonNum].UUID
 		m.state = Fetch
 		return m
 	}
