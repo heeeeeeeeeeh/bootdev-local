@@ -489,6 +489,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					cmds = append(cmds, m.getNextLesson())
 				case CheckOutput:
 					cmds = append(cmds, m.CheckOutput())
+				case OutputSuccess:
+					cmds = append(cmds, m.getNextLesson())
+				case OutputFail:
+					cmds = append(cmds, m.openEditor())
 				case NextLesson:
 					cmds = append(cmds, m.getNextLesson())
 				case CourseFinished:
@@ -906,9 +910,6 @@ func (m Model) openEditor() tea.Cmd {
 	args := m.starterFiles
 	if codeEditor == "" {
 		codeEditor = "nvr"
-		if len(m.starterFiles) > 1 {
-			args = append(args, "-c", "vsplit", "-c", "wincmd p")
-		}
 		args = append(args, "-c", "Glow", "--remote-wait-silent")
 	}
 
@@ -977,9 +978,9 @@ func (m Model) CheckOutput() tea.Cmd {
 		cmd := exec.Command("bash", script, path.Join(m.response.Lesson.CourseSlug,
 			m.response.Lesson.ChapterSlug, m.response.Lesson.Slug))
 
-		var stderr, stdout bytes.Buffer
-		cmd.Stdout = &stdout
-		cmd.Stderr = &stderr
+		var out bytes.Buffer
+		cmd.Stdout = &out
+		cmd.Stderr = &out
 		err := cmd.Start()
 		if err != nil {
 			return errMsg{
@@ -990,15 +991,15 @@ func (m Model) CheckOutput() tea.Cmd {
 		cmd.Wait()
 
 		if cmd.ProcessState.ExitCode() != 0 {
-			m.content = stdout.String() + stderr.String()
+			m.content = out.String()
 			m.state = OutputFail
 		}
 
-		if stderr.String() == m.response.Lesson.LessonDataCodeCompletion.CodeExpectedOutput {
-			m.content = stderr.String()
+		if out.String() == m.response.Lesson.LessonDataCodeCompletion.CodeExpectedOutput {
+			m.content = out.String()
 			m.state = OutputSuccess
 		} else {
-			m.content = diff.CharacterDiff(stderr.String(), m.response.Lesson.LessonDataCodeCompletion.CodeExpectedOutput)
+			m.content = diff.CharacterDiff(out.String(), m.response.Lesson.LessonDataCodeCompletion.CodeExpectedOutput)
 			m.state = OutputFail
 		}
 		m.viewport = m.updateViewport()
