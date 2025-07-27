@@ -1,0 +1,1 @@
+gcc -Wall -Wextra -std=c11 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -include "../../lib/bootdev_prelude.h" *.c "../../lib/munit/munit.c" -I. $(find "../../lib" -mindepth 1 -maxdepth 1 -type d -printf "-I%p ") -o main_lesson -lrt && ./main_lesson
