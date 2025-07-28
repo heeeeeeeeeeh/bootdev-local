@@ -629,18 +629,18 @@ func (m Model) View() string {
 		return "Testing work."
 	case CodeTestSuccess:
 		m.title = "Code Test Successful"
-		return m.formatPager()
+		return m.formatPager(correctStyle)
 	case CodeTestFailed:
 		m.title = "Code Test Failed"
-		return m.formatPager()
+		return m.formatPager(incorrectStyle)
 	case CheckOutput:
 		return "Checking Output"
 	case OutputSuccess:
 		m.title = "Output Matches"
-		return m.formatPager()
+		return m.formatPager(correctStyle)
 	case OutputFail:
 		m.title = "Output does not match"
-		return m.formatPager()
+		return m.formatPager(incorrectStyle)
 	case NextLesson:
 		return "Press Enter to continue to next lesson. ctrl+c: quit"
 	case CourseFinished:
@@ -650,7 +650,11 @@ func (m Model) View() string {
 	}
 }
 
-func (m Model) formatPager() string {
+func (m Model) formatPager(styles ...lipgloss.Style) string {
+	for _, style := range styles {
+		m.viewport.Style = style
+		break
+	}
 	return strings.Join([]string{m.headerView(), m.viewport.View(), m.footerView()}, "\n")
 }
 
