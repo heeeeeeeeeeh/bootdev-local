@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -12,8 +13,10 @@ import (
 	"path"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/andreyvit/diff"
 	"github.com/charmbracelet/bubbles/list"
@@ -77,6 +80,13 @@ const (
 	CheckOutput
 	OutputSuccess
 	OutputFail
+	CLICheck
+	CLIDone
+	CLIFailed
+	CheckInput
+	InputFail
+	InputSuccess
+	Git
 	NextLesson
 	TrackSelect
 	CourseSelect
@@ -110,24 +120,146 @@ type MultipleChoiceData struct {
 	Question Question `json:"Question"`
 }
 
+type CLIData struct {
+	// ContainsCompleteDir bool
+	BaseURLDefault string
+	Steps          []CLIStep
+}
+
+type CLIStep struct {
+	CLICommand  *CLIStepCLICommand
+	HTTPRequest *CLIStepHTTPRequest
+}
+
+type CLIStepCLICommand struct {
+	Command string
+	Tests   []CLICommandTest
+}
+
+type CLICommandTest struct {
+	ExitCode           *int
+	StdoutContainsAll  []string
+	StdoutContainsNone []string
+	StdoutLinesGt      *int
+}
+
+type CLIStepHTTPRequest struct {
+	ResponseVariables []HTTPRequestResponseVariable
+	Tests             []HTTPRequestTest
+	Request           HTTPRequest
+}
+
+type HTTPRequest struct {
+	Method   string
+	FullURL  string
+	Headers  map[string]string
+	BodyJSON map[string]any
+
+	BasicAuth *HTTPBasicAuth
+	Actions   HTTPActions
+}
+
+type HTTPBasicAuth struct {
+	Username string
+	Password string
+}
+
+type HTTPActions struct {
+	DelayRequestByMs *int
+}
+
+type HTTPRequestTest struct {
+	StatusCode       *int
+	BodyContains     *string
+	BodyContainsNone *string
+	HeadersContain   *HTTPRequestTestHeader
+	TrailersContain  *HTTPRequestTestHeader
+	JSONValue        *HTTPRequestTestJSONValue
+}
+
+type HTTPRequestTestHeader struct {
+	Key   string
+	Value string
+}
+
+type HTTPRequestTestJSONValue struct {
+	Path        string
+	Operator    OperatorType
+	IntValue    *int
+	StringValue *string
+	BoolValue   *bool
+}
+
+type OperatorType string
+
+const (
+	OpEquals      OperatorType = "eq"
+	OpGreaterThan OperatorType = "gt"
+	OpContains    OperatorType = "contains"
+	OpNotContains OperatorType = "not_contains"
+)
+
+type HTTPRequestResponseVariable struct {
+	Name string
+	Path string
+}
+
+type CLIStepResult struct {
+	CLICommandResult  *CLICommandResult
+	HTTPRequestResult *HTTPRequestResult
+}
+
+type CLICommandResult struct {
+	ExitCode     int
+	FinalCommand string `json:"-"`
+	Stdout       string
+	Variables    map[string]string
+}
+
+type HTTPRequestResult struct {
+	Err              string `json:"-"`
+	StatusCode       int
+	ResponseHeaders  map[string]string
+	ResponseTrailers map[string]string
+	BodyString       string
+	Variables        map[string]string
+	Request          CLIStepHTTPRequest
+}
+
+const BaseURLOverrideRequired = "override"
+
 type Lesson struct {
 	UUID                     string             `json:"UUID"`
 	Title                    string             `json:"Title"`
 	LessonDataMultipleChoice MultipleChoiceData `json:"LessonDataMultipleChoice"`
 	LessonDataCodeTests      CodeData           `json:"LessonDataCodeTests"`
+	LessonDataCLI            CLIData            `json:"LessonDataCLI"`
+}
+
+type Check struct {
+	ContainsAll  []string `json:"ContainsAll"`
+	MatchesOne   []string `json:"MatchesOne"`
+	ContainsNone []string `json:"ContainsNone"`
 }
 
 type Response struct {
 	Lesson struct {
-		UUID                string `json:"UUID"`
-		Slug                string `json:"Slug"`
-		Type                string `json:"Type"`
-		CourseUUID          string `json:"CourseUUID"`
-		CourseTitle         string `json:"CourseTitle"`
-		CourseSlug          string `json:"CourseSlug"`
-		ChapterUUID         string `json:"ChapterUUID"`
-		ChapterTitle        string `json:"ChapterTitle"`
-		ChapterSlug         string `json:"ChapterSlug"`
+		UUID             string `json:"UUID"`
+		Slug             string `json:"Slug"`
+		Type             string `json:"Type"`
+		CourseUUID       string `json:"CourseUUID"`
+		CourseTitle      string `json:"CourseTitle"`
+		CourseSlug       string `json:"CourseSlug"`
+		ChapterUUID      string `json:"ChapterUUID"`
+		ChapterTitle     string `json:"ChapterTitle"`
+		ChapterSlug      string `json:"ChapterSlug"`
+		LessonDataManual struct {
+			Readme string `json:"Readme"`
+		}
+		LessonDataTextInput struct {
+			Readme        string `json:"Readme"`
+			TextInputData Check  `json:"TextInputData"`
+		}
 		LessonDataCodeTests struct {
 			ProgLang     string
 			StarterFiles []StarterFile `json:"StarterFiles"`
@@ -155,6 +287,10 @@ type Response struct {
 				Answer   string   `json:"Answer"`
 			} `json:"Question"`
 		} `json:"LessonDataMultipleChoice"`
+		LessonDataCLI struct {
+			Readme  string
+			CLIData `json:"CLIData"`
+		} `json:"LessonDataCLI"`
 	} `json:"Lesson"`
 	Course struct {
 		UUID                         string   `json:"UUID"`
@@ -263,6 +399,7 @@ type TracksResponse []Track
 const (
 	BASE_API_URL        = "https://api.boot.dev/v1/"
 	LESSON_URL          = BASE_API_URL + "static/lessons/"
+	CHECK_URL           = BASE_API_URL + "/lessons/%s/checks"
 	COURSE_URL          = BASE_API_URL + "static/courses/slug/"
 	COURSE_PROGRESS_URL = BASE_API_URL + "course_progress_by_lesson/"
 	TRACK_URL           = BASE_API_URL + "static/tracks/"
@@ -272,6 +409,16 @@ const (
 type errMsg struct {
 	err error
 }
+
+type (
+	stepStartMsg struct{ cmd string }
+	stepDoneMsg  struct{ stdout string }
+	CLIErr       struct {
+		err    error
+		stdout string
+	}
+	CLIDoneMsg struct{}
+)
 
 func (e errMsg) Error() string { return e.err.Error() }
 
@@ -440,6 +587,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				}
 			}
+		case "e":
+			switch m.state {
+			case CodeTestSuccess:
+				cmds = append(cmds, m.openEditor())
+			}
 		case "enter":
 			if m.list.FilterState() != list.Filtering {
 				switch m.state {
@@ -475,25 +627,33 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					// Reset to question state for retry
 					m.state = QuestionStart
 				case QuestionCorrect:
-					m.state = NextLesson
-					cmds = append(cmds, m.getNextLesson())
+					m.state = Git
+					cmds = append(cmds, m.commitRepo())
 				case QuestionFailed:
-					m.state = NextLesson
-					cmds = append(cmds, m.getNextLesson())
+					m.state = Git
+					cmds = append(cmds, m.commitRepo())
 				case CodeTest:
 					// TODO: add testing for lessons without unit tests
 					cmds = append(cmds, m.testCode())
 				case CodeTestFailed:
 					cmds = append(cmds, m.openEditor())
 				case CodeTestSuccess:
-					cmds = append(cmds, m.getNextLesson())
+					cmds = append(cmds, m.commitRepo())
 				case CheckOutput:
 					cmds = append(cmds, m.CheckOutput())
 				case OutputSuccess:
-					cmds = append(cmds, m.getNextLesson())
+					cmds = append(cmds, m.commitRepo())
 				case OutputFail:
 					cmds = append(cmds, m.openEditor())
-				case NextLesson:
+				case CLIDone:
+					cmds = append(cmds, m.commitRepo())
+				case CLIFailed:
+					cmds = append(cmds, m.openEditor())
+				case InputSuccess:
+					cmds = append(cmds, m.commitRepo())
+				case InputFail:
+					cmds = append(cmds, m.openEditor())
+				case Git:
 					cmds = append(cmds, m.getNextLesson())
 				case CourseFinished:
 					cmds = append(cmds, tea.Quit)
@@ -535,8 +695,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.getLessonType())
 		case CodeTestFailed:
 		case CodeTestSuccess:
-		case NextLesson:
-			cmds = append(cmds, m.getNextLesson())
+		case CLICheck:
+			cmds = append(cmds, m.CLIChecks())
 		case Fetch:
 			cmds = append(cmds, m.fetchLesson)
 		}
@@ -556,6 +716,30 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		m.state = WriteFiles
 		cmds = append(cmds, m.createCodeFiles())
+	case stepStartMsg:
+		m.content += fmt.Sprintf("󰣇 ❯ %s\n", msg.cmd)
+		m.viewport = m.updateViewport()
+	case stepDoneMsg:
+		m.content += fmt.Sprintf("%s\n\n", msg.stdout)
+		m.viewport = m.updateViewport()
+	case CLIDoneMsg:
+		m.content += "done"
+		m.viewport = m.updateViewport()
+		m.state = CLIDone
+	case CLIErr:
+		m.state = CLIFailed
+		m.content = msg.err.Error() + msg.stdout
+		m.viewport = m.updateViewport()
+	case []*exec.Cmd:
+		m.state = Git
+		m.content = getCmdPipe(msg[0].Stdout)
+		m.viewport = m.updateViewport()
+		cmds = append(cmds, func() tea.Msg {
+			return m.updateCmdOutput(msg)
+		})
+	case *exec.Cmd:
+		m.state = NextLesson
+		cmds = append(cmds, m.getNextLesson())
 	}
 
 	m.list, cmd = m.list.Update(msg)
@@ -641,6 +825,21 @@ func (m Model) View() string {
 	case OutputFail:
 		m.title = "Output does not match"
 		return m.formatPager(incorrectStyle)
+	case CLICheck, CLIDone:
+		m.title = "Running commands"
+		return m.formatPager()
+	case CLIFailed:
+		m.title = "Command failed"
+		return m.formatPager()
+	case Git:
+		m.title = "Pushing to repo"
+		return m.formatPager()
+	case InputSuccess:
+		m.title = "Input Matches"
+		return m.formatPager()
+	case InputFail:
+		m.title = "Input does not Match"
+		return m.formatPager()
 	case NextLesson:
 		return "Press Enter to continue to next lesson. ctrl+c: quit"
 	case CourseFinished:
@@ -784,7 +983,7 @@ func main() {
 	}
 }
 
-func (m Model) getLessonType() tea.Cmd {
+func (m *Model) getLessonType() tea.Cmd {
 	return func() tea.Msg {
 		switch m.response.Lesson.Type {
 		case "type_choice":
@@ -796,9 +995,202 @@ func (m Model) getLessonType() tea.Cmd {
 		case "type_code":
 			m.state = CheckOutput
 			return m.CheckOutput()()
+		case "type_cli":
+			m.state = CLICheck
+		case "type_text_input":
+			m.state = CheckInput
+			var err error
+			m.response.Lesson.LessonDataTextInput.TextInputData, err = m.getLessonCheck()
+			if err != nil {
+				if err.Error() != "HTTP request failed with status: 403 Forbidden" {
+					return errMsg{err: err}
+				}
+				m.state = Git
+				return m.commitRepo()()
+			} else {
+				return m.CheckInput()()
+			}
+		case "type_manual":
+			return m.commitRepo()()
 		}
-		return m
+		return *m
 	}
+}
+
+func (m Model) getLessonCheck() (Check, error) {
+	t := request[Check](fmt.Sprintf(CHECK_URL, m.response.Lesson.UUID))
+	switch t := t.(type) {
+	case *Check:
+		return *t, nil
+	case errMsg:
+		return Check{}, t.err
+	default:
+		return Check{}, errors.New("failed to request lesson check")
+	}
+}
+
+func (m *Model) CheckInput() tea.Cmd {
+	return func() tea.Msg {
+		c, err := os.ReadFile(path.Join(m.lessonPath(), "input.txt"))
+		content := string(c)
+		if err != nil {
+			return errMsg{
+				err: fmt.Errorf("could not read user input file:\n %s", err),
+			}
+		}
+		check := m.response.Lesson.LessonDataTextInput.TextInputData
+
+		if check.ContainsAll != nil {
+			var isError bool
+			str := "Expect input file to contain all of:"
+			for _, t := range check.ContainsAll {
+				str += fmt.Sprintf("\n      - '%s'", t)
+				if !strings.Contains(content, t) {
+					isError = true
+				}
+			}
+			if isError {
+				str += fmt.Sprintf("\nContent is:\n%s", content)
+				m.state = InputFail
+				m.content = str
+				m.viewport = m.updateViewport()
+				return *m
+			}
+		}
+		if check.MatchesOne != nil {
+			isError := true
+			str := "Expect input file to contain one of:"
+			for _, t := range check.MatchesOne {
+				str += fmt.Sprintf("\n      - '%s'", t)
+				if strings.Contains(content, t) {
+					isError = false
+				}
+			}
+			if isError {
+				str += fmt.Sprintf("\nContent is:\n%s", content)
+				m.state = InputFail
+				m.content = str
+				m.viewport = m.updateViewport()
+				return *m
+			}
+		}
+		if check.ContainsNone != nil {
+			isError := false
+			str := "Expect input file to not contain any of:"
+			for _, t := range check.ContainsNone {
+				str += fmt.Sprintf("\n      - '%s'", t)
+				if strings.Contains(content, t) {
+					isError = true
+				}
+			}
+			if isError {
+				str += fmt.Sprintf("\nContent is:\n%s", content)
+				m.state = InputFail
+				m.content = str
+				m.viewport = m.updateViewport()
+				return *m
+			}
+		}
+		m.content = content
+		m.state = InputSuccess
+		m.viewport = m.updateViewport()
+		return *m
+	}
+}
+
+func (m *Model) CLIChecks() tea.Cmd {
+	return func() tea.Msg {
+		cliData := m.response.Lesson.LessonDataCLI.CLIData
+		variables := make(map[string]string)
+
+		// prefer overrideBaseURL if provided, otherwise use BaseURLDefault
+
+		for _, step := range cliData.Steps {
+			if step.CLICommand != nil {
+				p.Send(stepStartMsg{cmd: step.CLICommand.Command})
+				result := m.runCLICommand(*step.CLICommand, variables)
+				for _, test := range step.CLICommand.Tests {
+					if err := m.isCLIError(result, &test, result.Variables); err != nil {
+						return CLIErr{err: err, stdout: result.Stdout}
+					}
+				}
+				p.Send(stepDoneMsg{stdout: result.Stdout})
+			} else if step.HTTPRequest != nil {
+				return errMsg{errors.New("unimplemented step: HTTPRequest")}
+			} else {
+				return errMsg{errors.New("unable to run lesson: missing step")}
+			}
+		}
+		return CLIDoneMsg{}
+	}
+}
+
+func (m Model) isCLIError(result CLICommandResult, test *CLICommandTest, variables map[string]string) error {
+	if test.ExitCode != nil && *test.ExitCode != result.ExitCode {
+		return fmt.Errorf("expect exit code %d", *test.ExitCode)
+	}
+	if test.StdoutLinesGt != nil && *test.StdoutLinesGt > len(strings.Split(result.Stdout, "\n")) {
+		return fmt.Errorf("expect > %d lines on stdout", *test.StdoutLinesGt)
+	}
+	if test.StdoutContainsAll != nil {
+		str := "Expect stdout to contain all of:"
+		var hasError bool
+		for _, contains := range test.StdoutContainsAll {
+			interpolatedContains := InterpolateVariables(contains, variables)
+			str += fmt.Sprintf("\n      - '%s'", interpolatedContains)
+			if !strings.Contains(result.Stdout, interpolatedContains) {
+				hasError = true
+			}
+		}
+		if hasError {
+			return errors.New(str)
+		}
+	}
+	if test.StdoutContainsNone != nil {
+		str := "Expect stdout to contain none of:"
+		var hasError bool
+		for _, containsNone := range test.StdoutContainsNone {
+			interpolatedContains := InterpolateVariables(containsNone, variables)
+			str += fmt.Sprintf("\n      - '%s'", interpolatedContains)
+			if strings.Contains(result.Stdout, interpolatedContains) {
+				hasError = true
+			}
+		}
+		if hasError {
+			return errors.New(str)
+		}
+	}
+	return nil
+}
+
+func (m Model) runCLICommand(command CLIStepCLICommand, variables map[string]string) (result CLICommandResult) {
+	finalCommand := InterpolateVariables(command.Command, variables)
+	result.FinalCommand = finalCommand
+
+	cmd := exec.Command("sh", "-c", finalCommand)
+	cmd.Dir = m.lessonPath()
+	cmd.Env = append(os.Environ(), "LANG=en_US.UTF-8")
+	b, err := cmd.CombinedOutput()
+	if ee, ok := err.(*exec.ExitError); ok {
+		result.ExitCode = ee.ExitCode()
+	} else if err != nil {
+		result.ExitCode = -2
+	}
+	result.Stdout = strings.TrimRight(string(b), " \n\t\r")
+	result.Variables = variables
+	return result
+}
+
+func InterpolateVariables(template string, vars map[string]string) string {
+	r := regexp.MustCompile(`\$\{([^}]+)\}`)
+	return r.ReplaceAllStringFunc(template, func(m string) string {
+		// Extract the key from the match, which is in the form ${key}
+		key := strings.TrimSuffix(strings.TrimPrefix(m, "${"), "}")
+		if val, ok := vars[key]; ok {
+			return val
+		}
+		return m // return the original placeholder if no substitution found
+	})
 }
 
 func (m Model) createList(titleStruct any) list.Model {
@@ -876,6 +1268,19 @@ func (m Model) createCodeFiles() tea.Cmd {
 		case "type_choice":
 			starterFiles = []StarterFile{}
 			readme = m.response.Lesson.LessonDataMultipleChoice.Readme
+			question := m.response.Lesson.LessonDataMultipleChoice.Question.Question
+			choices := m.response.Lesson.LessonDataMultipleChoice.Question.Answers
+			readme = fmt.Sprintf("%s\n# Question\n### %s\n- %s", readme, question, strings.Join(choices, "\n- "))
+		case "type_cli":
+			starterFiles = []StarterFile{}
+			readme = m.response.Lesson.LessonDataCLI.Readme
+		case "type_manual":
+			starterFiles = []StarterFile{}
+			readme = m.response.Lesson.LessonDataManual.Readme
+		case "type_text_input":
+			starterFiles = []StarterFile{{Name: "input.txt"}}
+			readme = m.response.Lesson.LessonDataTextInput.Readme
+
 		default:
 			return errMsg{err: fmt.Errorf("unknown lesson type: %s", m.response.Lesson.Type)}
 		}
@@ -890,7 +1295,7 @@ func (m Model) createCodeFiles() tea.Cmd {
 					return errMsg{err: fmt.Errorf("failed to create %s: %v", filePath, err)}
 				}
 			}
-			m.starterFiles = append(m.starterFiles, filePath)
+			m.starterFiles = append(m.starterFiles, file.Name)
 		}
 
 		// Create README.md in the exercise directory
@@ -898,7 +1303,7 @@ func (m Model) createCodeFiles() tea.Cmd {
 		if err := os.WriteFile(readmePath, []byte(readme), 0644); err != nil {
 			return errMsg{err: fmt.Errorf("failed to create README.md: %v", err)}
 		}
-		m.starterFiles = append(m.starterFiles, readmePath)
+		m.starterFiles = append(m.starterFiles, "README.md")
 
 		if m.download {
 			m.state = NextLesson
@@ -918,6 +1323,10 @@ func (m Model) openEditor() tea.Cmd {
 	}
 
 	cmd := exec.Command(codeEditor, args...)
+	cmd.Dir = m.lessonPath()
+	if m.response.Lesson.Type == "type_cli" || m.response.Lesson.Type == "type_manual" || m.response.Lesson.Type == "type_text_input" {
+		cmd.Args = append(cmd.Args, "-c", "lua vim.g.cli=true")
+	}
 
 	return tea.ExecProcess(cmd, func(err error) tea.Msg {
 		if err != nil {
@@ -1011,67 +1420,84 @@ func (m Model) CheckOutput() tea.Cmd {
 	}
 }
 
-func (m Model) commitRepo() error {
-	if _, err := os.Stat(".git"); err != nil {
-		return errMsg{
-			err: fmt.Errorf("initialize git repo"),
+func (m Model) commitRepo() tea.Cmd {
+	return func() tea.Msg {
+		var stdout bytes.Buffer
+		if _, err := os.Stat(".git"); err != nil {
+			return errMsg{
+				err: fmt.Errorf("initialize git repo"),
+			}
 		}
-	}
 
-	path := m.lessonPath()
-	cmd := exec.Command("git", "add", path)
-	cmd.Stderr = &bytes.Buffer{}
-	err := cmd.Start()
-	if err != nil {
-		return errMsg{
-			err: fmt.Errorf("could not add %s to git repo: %v", path, err),
-		}
-	}
-	cmd.Wait()
+		path := m.lessonPath()
+		var cmds []*exec.Cmd
+		cmds = append(cmds, exec.Command("git", "add", path))
+		cmds[0].Stdout = &stdout
+		cmds[0].Stderr = &bytes.Buffer{}
 
-	if cmd.ProcessState.ExitCode() != 0 {
-		return errMsg{
-			err: fmt.Errorf("could not add %s to git repo: %v", path, cmd.Stderr),
+		courseSlug := m.response.Lesson.CourseSlug
+		lessonNum := m.getLessonNumber()
+		chapNum := m.getChapterNumber()
+		msg := fmt.Sprintf("%s - Chapter %d - Lesson %d", courseSlug, chapNum, lessonNum)
+		cmds = append(cmds, exec.Command("git", "commit", "-m", msg))
+		args := []string{"push"}
+		if pid, err := GetTracerPid(); err == nil && pid > 0 {
+			args = append(args, "-n", "-v")
 		}
-	}
+		cmds = append(cmds, exec.Command("git", args...))
 
-	courseSlug := m.response.Lesson.CourseSlug
-	lessonNum := m.getLessonNumber()
-	chapNum := m.getChapterNumber()
-	msg := fmt.Sprintf("%s - Chapter %d - Lesson %d", courseSlug, chapNum, lessonNum)
-	cmd = exec.Command("git", "commit", "-m", msg)
-	err = cmd.Start()
-	if err != nil {
-		return errMsg{
-			err: fmt.Errorf("could not start git commit: \n%v\n%v", cmd.Args, err),
-		}
+		m.state = Git
+		return cmds
 	}
-	cmd.Wait()
-	if cmd.ProcessState.ExitCode() != 0 {
-		return errMsg{
-			err: fmt.Errorf("could not commit git repo: %v", cmd.Stderr),
-		}
-	}
+}
 
-	cmd = exec.Command("git", "push")
-	err = cmd.Start()
-	if err != nil {
-		return errMsg{
-			err: fmt.Errorf("git push could not start %v %v", cmd.Args, err),
+func (m Model) updateCmdOutput(cmds []*exec.Cmd) tea.Msg {
+	cmd := cmds[0]
+	if cmd.Process == nil {
+		fmt.Fprintf(cmd.Stdout, "󰣇 ❯ %v", strings.Join(cmd.Args, " "))
+		if err := cmd.Start(); err != nil {
+			return errMsg{
+				err: fmt.Errorf("failed to start %v\n%v", strings.Join(cmd.Args, " "), err),
+			}
+		}
+		cmd.Stderr = &bytes.Buffer{}
+	} else {
+		var status syscall.WaitStatus
+		pid, err := syscall.Wait4(cmd.Process.Pid, &status, syscall.WNOHANG, nil)
+		if err != nil {
+			return errMsg{
+				err: fmt.Errorf("failed to reap process %d: %v", cmd.Process.Pid, err),
+			}
+		}
+		if pid > 0 {
+			if status.Exited() {
+				if status.ExitStatus() != 0 {
+					fmt.Fprintf(cmd.Stdout, "\"%v\" failed with exit code %v\n%v", strings.Join(cmd.Args, " "), status.ExitStatus(), getCmdPipe(cmd.Stderr))
+				}
+				if len(cmds) == 1 {
+					return cmd
+				} else {
+					cmds[1].Stdout = cmd.Stdout
+					cmds = cmds[1:]
+				}
+			}
 		}
 	}
-	cmd.Wait()
-	if cmd.ProcessState.ExitCode() != 0 {
-		return errMsg{
-			err: fmt.Errorf("could not push repo: %v", cmd.Stderr),
-		}
-	}
+	return cmds
+}
 
-	return nil
+func getCmdPipe(w io.Writer) string {
+	e := ""
+	switch a := w.(type) {
+	case *bytes.Buffer:
+		e = a.String()
+	}
+	return e
 }
 
 func (m Model) getNextLesson() tea.Cmd {
 	return func() tea.Msg {
+		m.attempts = 0
 		if m.courseProgressResponse == nil {
 			res := request[CourseProgressResponse](COURSE_PROGRESS_URL + m.response.Lesson.UUID)
 			switch prog := res.(type) {
@@ -1124,4 +1550,25 @@ func (m Model) getLessonNumber() int {
 		}
 	}
 	return 0
+}
+
+func GetTracerPid() (int, error) {
+	file, err := os.Open("/proc/self/status")
+	if err != nil {
+		return -1, fmt.Errorf("can't open process status file: %w", err)
+	}
+	defer file.Close()
+
+	for {
+		var tpid int
+		num, err := fmt.Fscanf(file, "TracerPid: %d\n", &tpid)
+		if err == io.EOF {
+			break
+		}
+		if num != 0 {
+			return tpid, nil
+		}
+	}
+
+	return -1, errors.New("unknown format of process status file")
 }
