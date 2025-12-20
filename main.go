@@ -703,6 +703,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					cmds = append(cmds, m.openEditor())
 				case InputDir:
 					m.dir.Blur()
+					filePath := path.Join(m.lessonPath(), ".dir")
+					os.WriteFile(filePath, []byte(m.dir.Value()), 0o755)
 					cmds = append(cmds, m.CLIChecks())
 				case CLIDone:
 					cmds = append(cmds, m.commitRepo())
@@ -1311,7 +1313,7 @@ func (m Model) lessonPath() string {
 	if reflect.ValueOf(m.response.Lesson.LessonDataCLI).IsZero() {
 		return path.Join(m.response.Lesson.CourseSlug, m.response.Lesson.ChapterSlug, m.response.Lesson.Slug)
 	}
-	return m.response.Course.Slug
+	return m.response.Lesson.CourseSlug
 }
 
 func (m Model) createCodeFiles() tea.Cmd {
