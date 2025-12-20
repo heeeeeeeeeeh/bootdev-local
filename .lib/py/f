@@ -1,0 +1,12 @@
+
+rexps = ["title:nvr.*", "title:n?vim.*", "title:bootdev-fetcher"]
+for rexp in rexps:
+    ret = subprocess.run(
+        ["hyprctl", "dispatch", "focuswindow", rexp],
+        stdout=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
+    )
+    print(ret.stdout)
+    if str(ret.stdout) == "No such window found\n":
+        continue
+    break
