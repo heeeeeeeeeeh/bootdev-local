@@ -20,9 +20,11 @@ import (
 
 	"github.com/andreyvit/diff"
 	"github.com/charmbracelet/bubbles/list"
+	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/thoas/go-funk"
 )
 
 // Styles
@@ -80,6 +82,7 @@ const (
 	CheckOutput
 	OutputSuccess
 	OutputFail
+	InputDir
 	CLICheck
 	CLIDone
 	CLIFailed
@@ -271,6 +274,12 @@ type Response struct {
 			Readme             string        `json:"Readme"`
 			CodeExpectedOutput string        `json:"CodeExpectedOutput"`
 		} `json:"LessonDataCodeCompletion"`
+		LessonDataCodeOutput struct {
+			ProgLang           string
+			StarterFiles       []StarterFile `json:"StarterFiles"`
+			Readme             string        `json:"Readme"`
+			CodeExpectedOutput string        `json:"CodeExpectedOutput"`
+		} `json:"LessonDataCodeOutput"`
 		LessonDataChoice struct {
 			Readme   string `json:"Readme"`
 			Question struct {
@@ -462,6 +471,40 @@ func (d ItemDelegate) Render(w io.Writer, m list.Model, index int, listItem list
 	fmt.Fprint(w, fn(str))
 }
 
+func (m *Model) getDirSuggestions() tea.Cmd {
+	return func() tea.Msg {
+		dir := m.dir.Value()
+
+		if dir != "" {
+			if entries, err := os.ReadDir(dir); err == nil {
+				m.setDirSuggestions(dir, entries)
+			} else if path.Dir(dir) != "" {
+				if entries, err := os.ReadDir(dir); err == nil {
+					m.setDirSuggestions(dir, entries)
+				}
+			}
+		}
+		return nil
+	}
+}
+
+func (m *Model) setDirSuggestions(root string, entries []os.DirEntry) {
+	s := funk.Map(entries, func(entry os.DirEntry) string {
+		isHiddenFile := []rune(entry.Name())[0] == 46
+		if entry.IsDir() && !isHiddenFile {
+			return path.Join(root, entry.Name())
+		}
+		return ""
+	})
+	s = funk.Filter(s, func(a string) bool {
+		return a != ""
+	})
+	switch s := s.(type) {
+	case []string:
+		m.dir.SetSuggestions(s)
+	}
+}
+
 // Model for our Bubble Tea application
 type Model struct {
 	ready                  bool
@@ -488,6 +531,7 @@ type Model struct {
 	codeEditor             string
 	attempts               int
 	download               bool
+	dir                    textinput.Model
 }
 
 func convertToAPIURL(endpoint string, inputURL string) string {
@@ -501,6 +545,13 @@ func convertToAPIURL(endpoint string, inputURL string) string {
 func initialModel(url string, mdEditor string, codeEditor string) Model {
 	var lessonURL string
 	var courseURL string
+	dir := textinput.New()
+	if d, err := os.Getwd(); err == nil {
+		dir.SetValue(d)
+	}
+
+	dir.ShowSuggestions = true
+	dir.Prompt = "Enter Directory: "
 	download := false
 	if !reflect.ValueOf(url).IsZero() {
 		if strings.Contains(url, "courses") {
@@ -526,6 +577,7 @@ func initialModel(url string, mdEditor string, codeEditor string) Model {
 		codeEditor:             codeEditor,
 		courseProgressResponse: nil,
 		response:               &Response{},
+		dir:                    dir,
 	}
 }
 
@@ -555,6 +607,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	)
 	m.viewport, cmd = m.viewport.Update(msg)
 	cmds = append(cmds, cmd)
+	m.dir, cmd = m.dir.Update(msg)
+	cmds = append(cmds, cmd)
+	cmds = append(cmds, m.getDirSuggestions())
 
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
@@ -645,6 +700,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					cmds = append(cmds, m.commitRepo())
 				case OutputFail:
 					cmds = append(cmds, m.openEditor())
+				case InputDir:
+					m.dir.Blur()
+					cmds = append(cmds, m.CLIChecks())
 				case CLIDone:
 					cmds = append(cmds, m.commitRepo())
 				case CLIFailed:
@@ -665,6 +723,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		m.dir.Width = m.width / 2
 		if !m.ready {
 			m.updateViewport()
 		} else {
@@ -712,7 +771,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// fmt.Println("📦 Processing response...")
 		m.response.Lesson = msg.Lesson
 		m.lessonURL = LESSON_URL + msg.Lesson.UUID
-		os.WriteFile(".last", []byte(m.lessonURL), 0666)
+		os.WriteFile(".last", []byte(m.lessonURL), 0o666)
 
 		m.state = WriteFiles
 		cmds = append(cmds, m.createCodeFiles())
@@ -825,6 +884,8 @@ func (m Model) View() string {
 	case OutputFail:
 		m.title = "Output does not match"
 		return m.formatPager(incorrectStyle)
+	case InputDir:
+		return m.dir.View()
 	case CLICheck, CLIDone:
 		m.title = "Running commands"
 		return m.formatPager()
@@ -996,7 +1057,9 @@ func (m *Model) getLessonType() tea.Cmd {
 			m.state = CheckOutput
 			return m.CheckOutput()()
 		case "type_cli":
-			m.state = CLICheck
+			m.dir.SetValue(m.lessonPath())
+			m.state = InputDir
+			m.dir.Focus()
 		case "type_text_input":
 			m.state = CheckInput
 			var err error
@@ -1121,13 +1184,14 @@ func (m *Model) CLIChecks() tea.Cmd {
 				return errMsg{errors.New("unable to run lesson: missing step")}
 			}
 		}
+		os.WriteFile(path.Join(m.lessonPath(), ".dir"), []byte(m.dir.Value()), 0o655)
 		return CLIDoneMsg{}
 	}
 }
 
 func (m Model) isCLIError(result CLICommandResult, test *CLICommandTest, variables map[string]string) error {
 	if test.ExitCode != nil && *test.ExitCode != result.ExitCode {
-		return fmt.Errorf("expect exit code %d", *test.ExitCode)
+		return fmt.Errorf("expect exit code %d\n", *test.ExitCode)
 	}
 	if test.StdoutLinesGt != nil && *test.StdoutLinesGt > len(strings.Split(result.Stdout, "\n")) {
 		return fmt.Errorf("expect > %d lines on stdout", *test.StdoutLinesGt)
@@ -1168,15 +1232,16 @@ func (m Model) runCLICommand(command CLIStepCLICommand, variables map[string]str
 	result.FinalCommand = finalCommand
 
 	cmd := exec.Command("sh", "-c", finalCommand)
-	cmd.Dir = m.lessonPath()
+	cmd.Dir = m.dir.Value()
 	cmd.Env = append(os.Environ(), "LANG=en_US.UTF-8")
 	b, err := cmd.CombinedOutput()
+	result.Stdout = strings.TrimRight(string(b), " \n\t\r")
 	if ee, ok := err.(*exec.ExitError); ok {
 		result.ExitCode = ee.ExitCode()
 	} else if err != nil {
 		result.ExitCode = -2
+		result.Stdout = err.Error()
 	}
-	result.Stdout = strings.TrimRight(string(b), " \n\t\r")
 	result.Variables = variables
 	return result
 }
@@ -1250,7 +1315,7 @@ func (m Model) createCodeFiles() tea.Cmd {
 		// Create chapter directory if it doesn't exist
 		chapterDir := fmt.Sprintf("%s/%s", m.response.Lesson.CourseSlug, m.response.Lesson.ChapterSlug)
 		exerciseDir := fmt.Sprintf("%s/%s", chapterDir, m.response.Lesson.Slug)
-		if err := os.MkdirAll(exerciseDir, 0755); err != nil {
+		if err := os.MkdirAll(exerciseDir, 0o755); err != nil {
 			return errMsg{err: fmt.Errorf("failed to create exercise directory: %v", err)}
 		}
 
@@ -1263,8 +1328,13 @@ func (m Model) createCodeFiles() tea.Cmd {
 			starterFiles = m.response.Lesson.LessonDataCodeTests.StarterFiles
 			readme = m.response.Lesson.LessonDataCodeTests.Readme
 		case "type_code":
-			starterFiles = m.response.Lesson.LessonDataCodeCompletion.StarterFiles
-			readme = m.response.Lesson.LessonDataCodeCompletion.Readme
+			if m.response.Lesson.LessonDataCodeCompletion.Readme != "" {
+				starterFiles = m.response.Lesson.LessonDataCodeCompletion.StarterFiles
+				readme = m.response.Lesson.LessonDataCodeCompletion.Readme
+			} else {
+				starterFiles = m.response.Lesson.LessonDataCodeOutput.StarterFiles
+				readme = m.response.Lesson.LessonDataCodeOutput.Readme
+			}
 		case "type_choice":
 			starterFiles = []StarterFile{}
 			readme = m.response.Lesson.LessonDataMultipleChoice.Readme
@@ -1285,13 +1355,14 @@ func (m Model) createCodeFiles() tea.Cmd {
 			return errMsg{err: fmt.Errorf("unknown lesson type: %s", m.response.Lesson.Type)}
 		}
 
+		m.starterFiles = append(m.starterFiles, "README.md")
 		for _, file := range starterFiles {
 			if file.IsHidden {
 				continue // Skip hidden files
 			}
 			filePath := filepath.Join(exerciseDir, file.Name)
 			if _, err := os.Stat(filePath); err != nil {
-				if err := os.WriteFile(filePath, []byte(file.Content), 0644); err != nil {
+				if err := os.WriteFile(filePath, []byte(file.Content), 0o644); err != nil {
 					return errMsg{err: fmt.Errorf("failed to create %s: %v", filePath, err)}
 				}
 			}
@@ -1300,10 +1371,9 @@ func (m Model) createCodeFiles() tea.Cmd {
 
 		// Create README.md in the exercise directory
 		readmePath := filepath.Join(exerciseDir, "README.md")
-		if err := os.WriteFile(readmePath, []byte(readme), 0644); err != nil {
+		if err := os.WriteFile(readmePath, []byte(readme), 0o644); err != nil {
 			return errMsg{err: fmt.Errorf("failed to create README.md: %v", err)}
 		}
-		m.starterFiles = append(m.starterFiles, "README.md")
 
 		if m.download {
 			m.state = NextLesson
@@ -1316,16 +1386,16 @@ func (m Model) createCodeFiles() tea.Cmd {
 
 func (m Model) openEditor() tea.Cmd {
 	codeEditor := m.codeEditor
-	args := m.starterFiles
+	args := m.starterFiles[1:]
 	if codeEditor == "" {
 		codeEditor = "nvr"
-		args = append(args, "-c", "Glow", "--remote-wait-silent")
+		args = append(args, "-cc", fmt.Sprintf("terminal glow -p %s", m.starterFiles[0]), "-cc", "vsplit", "--remote-wait-silent")
 	}
 
 	cmd := exec.Command(codeEditor, args...)
 	cmd.Dir = m.lessonPath()
 	if m.response.Lesson.Type == "type_cli" || m.response.Lesson.Type == "type_manual" || m.response.Lesson.Type == "type_text_input" {
-		cmd.Args = append(cmd.Args, "-c", "lua vim.g.cli=true")
+		cmd.Args = append(cmd.Args, "-cc", "lua vim.g.bootdev=true")
 	}
 
 	return tea.ExecProcess(cmd, func(err error) tea.Msg {
@@ -1345,7 +1415,11 @@ func (m Model) testCode() tea.Cmd {
 		if m.response.Lesson.Type == "type_code_tests" {
 			makeFile = ".lib/" + m.response.Lesson.LessonDataCodeTests.ProgLang + "/Makefile"
 		} else {
-			makeFile = ".lib/" + m.response.Lesson.LessonDataCodeCompletion.ProgLang + "/Makefile"
+			if m.response.Lesson.LessonDataCodeCompletion.ProgLang != "" {
+				makeFile = ".lib/" + m.response.Lesson.LessonDataCodeCompletion.ProgLang + "/Makefile"
+			} else {
+				makeFile = ".lib/" + m.response.Lesson.LessonDataCodeOutput.ProgLang + "/Makefile"
+			}
 		}
 		if _, err := os.Stat(makeFile); err != nil {
 			return errMsg{
@@ -1382,7 +1456,12 @@ func (m Model) testCode() tea.Cmd {
 
 func (m Model) CheckOutput() tea.Cmd {
 	return func() tea.Msg {
-		script := ".lib/" + m.response.Lesson.LessonDataCodeCompletion.ProgLang + "/run"
+		var script string
+		if m.response.Lesson.LessonDataCodeCompletion.Readme != "" {
+			script = ".lib/" + m.response.Lesson.LessonDataCodeCompletion.ProgLang + "/run"
+		} else {
+			script = ".lib/" + m.response.Lesson.LessonDataCodeOutput.ProgLang + "/run"
+		}
 		if _, err := os.Stat(script); err != nil {
 			return errMsg{
 				err: fmt.Errorf("script to run program does not exist: %v", err),
@@ -1408,11 +1487,18 @@ func (m Model) CheckOutput() tea.Cmd {
 			m.state = OutputFail
 		}
 
-		if out.String() == m.response.Lesson.LessonDataCodeCompletion.CodeExpectedOutput {
+		var expectedOutput string
+		if m.response.Lesson.LessonDataCodeCompletion.CodeExpectedOutput != "" {
+			expectedOutput = m.response.Lesson.LessonDataCodeCompletion.CodeExpectedOutput
+		} else {
+			expectedOutput = m.response.Lesson.LessonDataCodeOutput.CodeExpectedOutput
+		}
+
+		if out.String() == expectedOutput {
 			m.content = out.String()
 			m.state = OutputSuccess
 		} else {
-			m.content = diff.CharacterDiff(out.String(), m.response.Lesson.LessonDataCodeCompletion.CodeExpectedOutput)
+			m.content = diff.CharacterDiff(out.String(), expectedOutput)
 			m.state = OutputFail
 		}
 		m.viewport = m.updateViewport()
