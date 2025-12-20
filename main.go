@@ -664,6 +664,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				case TrackSelect:
 					m.courseProgressURL = ""
+					m.lessonURL = ""
 					m.courseURL = ""
 					m.trackURL = TRACK_URL + (*m.tracksResponse)[index(m.list)].Slug
 					cmds = append(cmds, m.fetchLesson)
@@ -714,7 +715,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				case Git:
 					cmds = append(cmds, m.getNextLesson())
 				case CourseFinished:
-					cmds = append(cmds, tea.Quit)
+					m.state = TrackSelect
+					if reflect.ValueOf(m.tracksResponse).IsZero() {
+						cmds = append(cmds, func() tea.Msg { return request[TracksResponse](TRACKS_URL) })
+					} else {
+						m.state = TrackSelect
+						m.list = m.createList(m.tracksResponse)
+					}
 				case Failed:
 					cmds = append(cmds, tea.Quit)
 				}
@@ -904,7 +911,7 @@ func (m Model) View() string {
 	case NextLesson:
 		return "Press Enter to continue to next lesson. ctrl+c: quit"
 	case CourseFinished:
-		return "Course Finished 🎊. Enter to exit"
+		return "Course Finished 🎊. Enter to Select Track"
 	default:
 		return "\n"
 	}
@@ -1301,8 +1308,10 @@ func (m Model) createList(titleStruct any) list.Model {
 //		return strings.Join([]string{m.headerView(), m.viewport.View(), m.footerView()}, "\n")
 //	}
 func (m Model) lessonPath() string {
-	chapterDir := fmt.Sprintf("%s/%s", m.response.Lesson.CourseSlug, m.response.Lesson.ChapterSlug)
-	return fmt.Sprintf("%s/%s", chapterDir, m.response.Lesson.Slug)
+	if reflect.ValueOf(m.response.Lesson.LessonDataCLI).IsZero() {
+		return path.Join(m.response.Lesson.CourseSlug, m.response.Lesson.ChapterSlug, m.response.Lesson.Slug)
+	}
+	return m.response.Course.Slug
 }
 
 func (m Model) createCodeFiles() tea.Cmd {
@@ -1313,8 +1322,7 @@ func (m Model) createCodeFiles() tea.Cmd {
 		)
 
 		// Create chapter directory if it doesn't exist
-		chapterDir := fmt.Sprintf("%s/%s", m.response.Lesson.CourseSlug, m.response.Lesson.ChapterSlug)
-		exerciseDir := fmt.Sprintf("%s/%s", chapterDir, m.response.Lesson.Slug)
+		exerciseDir := m.lessonPath()
 		if err := os.MkdirAll(exerciseDir, 0o755); err != nil {
 			return errMsg{err: fmt.Errorf("failed to create exercise directory: %v", err)}
 		}
@@ -1426,8 +1434,7 @@ func (m Model) testCode() tea.Cmd {
 				err: fmt.Errorf("could not open MakeFile: %v", err),
 			}
 		}
-		cmd := exec.Command("make", "-f", makeFile, path.Join(m.response.Lesson.CourseSlug,
-			m.response.Lesson.ChapterSlug, m.response.Lesson.Slug))
+		cmd := exec.Command("make", "-f", makeFile, m.lessonPath())
 
 		var stderr, stdout bytes.Buffer
 		cmd.Stdout = &stdout
@@ -1467,8 +1474,7 @@ func (m Model) CheckOutput() tea.Cmd {
 				err: fmt.Errorf("script to run program does not exist: %v", err),
 			}
 		}
-		cmd := exec.Command("bash", script, path.Join(m.response.Lesson.CourseSlug,
-			m.response.Lesson.ChapterSlug, m.response.Lesson.Slug))
+		cmd := exec.Command("bash", script, m.lessonPath())
 
 		var out bytes.Buffer
 		cmd.Stdout = &out
