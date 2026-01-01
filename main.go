@@ -705,8 +705,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					cmds = append(cmds, m.openEditor())
 				case InputDir:
 					m.dir.Blur()
-					filePath := path.Join(m.lessonPath(), ".dir")
-					os.WriteFile(filePath, []byte(m.dir.Value()), 0o755)
+					filePath := path.Join(m.lessonPath(), "dir")
+					os.WriteFile(filePath, []byte(m.response.Lesson.Slug+"\n"+m.dir.Value()), 0o755)
 					cmds = append(cmds, m.CLIChecks())
 				case CLIDone:
 					cmds = append(cmds, m.commitRepo())
