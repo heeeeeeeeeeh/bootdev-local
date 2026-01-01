@@ -423,6 +423,8 @@ type (
 	stepStartMsg struct{ cmd string }
 	stepDoneMsg  struct{ stdout string }
 	CLIErr       struct {
+		cmd    string
+		dir    string
 		err    error
 		stdout string
 	}
@@ -796,7 +798,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.state = CLIDone
 	case CLIErr:
 		m.state = CLIFailed
-		m.content = msg.err.Error() + msg.stdout
+		m.content = fmt.Sprintf("Ran %s at %s\nFailed with error: %v\nCommand output:\n%s", msg.cmd, msg.dir, msg.err.Error(), msg.stdout)
 		m.viewport = m.updateViewport()
 	case []*exec.Cmd:
 		m.state = Git
@@ -1183,7 +1185,7 @@ func (m *Model) CLIChecks() tea.Cmd {
 				result := m.runCLICommand(*step.CLICommand, variables)
 				for _, test := range step.CLICommand.Tests {
 					if err := m.isCLIError(result, &test, result.Variables); err != nil {
-						return CLIErr{err: err, stdout: result.Stdout}
+						return CLIErr{cmd: result.FinalCommand, dir: m.dir.Value(), err: err, stdout: result.Stdout}
 					}
 				}
 				p.Send(stepDoneMsg{stdout: result.Stdout})
